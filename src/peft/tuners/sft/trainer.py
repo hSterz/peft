@@ -96,6 +96,8 @@ class SftSelector:
                 m.active_adapter in m.sft_delta
             ):
                 m.apply_hook(self.gradient_accumulation_hook(n))
+                if self.sft_config.drop_algorithm is not "magnitude":
+                    m.drop_hook_handle = m.register_module_forward_hook(self.get_wanda_hook())
 
     def end_selection_phase(self):
         logger.info('Ending selection phase')
@@ -111,6 +113,8 @@ class SftSelector:
                     m.active_adapter in m.sft_delta
                 ):
                     m.apply_hook(None)
+                    if self.sft_config.drop_algorithm is not "magnitude":
+                        m.drop_hook_handle.remove()
 
         # Replace all parameters if it's the first reselection step, linear
         # decay from initial rate otherwise.
@@ -131,10 +135,19 @@ class SftSelector:
         self.reselection_scores = {}
 
     def select(self, p):
+        
+        # select drop algorithm
+        if self.sft_config.drop_algorithm == "magnitude":
+            drop_fn = self.drop_magnitude
+        elif self.sft_config.drop_algorithm == "wanda":
+            drop_fn = self.drop_wanda
+        else:
+            raise ValueError(f'Invalid drop method {self.sft_config.drop_algorithm}')
+
         if self.sft_config.selection_algorithm == "sm3":
-            self.select_sm3(p)
+            self.select_sm3(p, drop_fn)
         elif self.sft_config.selection_algorithm == "rigl":
-            self.select_rigl(p)
+            self.select_rigl(p, drop_fn)
         else:
             raise ValueError(
                 f'Invalid selection method {self.sft_config.selection_algorithm}'
@@ -170,6 +183,24 @@ class SftSelector:
 
         return _gradient_accumulation_hook
 
+    def get_wanda_hook(self):
+        def wanda_hook(module, inp, output):
+            # ToDo: handle aggregation of multiple inputs
+            if len(inp.shape) == 2:
+                inp = inp.unsqueeze(0)
+            tmp = inp.shape[0]
+            if isinstance(self.layer, nn.Linear):
+                if len(inp.shape) == 3:
+                    inp = inp.reshape((-1, inp.shape[-1]))
+                inp = inp.t()
+
+            self.scaler_row *= self.nsamples / (self.nsamples+tmp)
+            self.nsamples += tmp
+
+            inp = inp.type(torch.float32)
+            self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples
+
+
     def active_sft_deltas(self):
         for n, m in self.model.named_modules():
             if (
@@ -182,8 +213,24 @@ class SftSelector:
                     m.sft_delta[m.active_adapter]
                 )
 
+    def drop_magnitude(self, num_to_reallocate, delta):
+        _, changing_indices = torch.topk(
+            torch.abs(delta.values),
+            num_to_reallocate,
+            largest=False,
+            sorted=True,
+        )
+        return changing_indices
+
+
+    def drop_wanda(self, num_to_reallocate, delta):
+        W_metric = torch.abs(delta.values.data) * torch.sqrt(delta.scaler_row.reshape((1,-1)))
+        sort_res = torch.sort(W_metric, dim=-1, stable=True)
+        indices = sort_res[1][:,:num_to_reallocate]
+        return indices
+
     @torch.no_grad()
-    def select_rigl(self, change_proportion):
+    def select_rigl(self, change_proportion, drop):
         n_replacements = 0
         total_params = 0
 
@@ -204,12 +251,7 @@ class SftSelector:
 
             num_to_reallocate = int(len(delta.values) * change_proportion)
             # Find the k deltas with smallest absolute values
-            _, changing_indices = torch.topk(
-                torch.abs(delta.values),
-                num_to_reallocate,
-                largest=False,
-                sorted=True,
-            )
+            changing_indices = drop(num_to_reallocate, delta)
             outgoing_params = delta.indices[changing_indices]
             # binary mask of weights to drop
             is_outgoing = torch.zeros(
@@ -301,18 +343,13 @@ class SftSelector:
         )
 
     @torch.no_grad()
-    def select_sm3(self, p):
+    def select_sm3(self, p, drop):
         n_replacements = 0
         total_params = 0
 
         for _, delta in self.active_sft_deltas():
             num_to_reallocate = int(len(delta.values) * p)
-            _, changing_indices = torch.topk(
-                torch.abs(delta.values),
-                num_to_reallocate,
-                largest=False,
-                sorted=True,
-            )
+            changing_indices = drop(num_to_reallocate, delta)
 
             is_current = torch.zeros(
                 [delta.dense_numel],
