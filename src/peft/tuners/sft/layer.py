@@ -195,12 +195,16 @@ def AddSparseDelta(_LinearType):
             )
             self.active_adapter = adapter_name
             self.hook = None
+            self.pre_forward_hook = None
 
             if not hasattr(self, "compute_dtype"):
                 self.compute_dtype = self.weight.dtype
 
         def apply_hook(self, hook):
             self.hook = hook
+
+        def apply_pre_forward_hook(self, hook):
+            self.pre_forward_hook = hook
 
         def update_layer(self, adapter_name, k, dtype=None, device=None):
             self.sft_delta[adapter_name] = SparseDelta(
@@ -235,6 +239,8 @@ def AddSparseDelta(_LinearType):
             return super().forward(input)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if self.pre_forward_hook is not None:
+                self.pre_forward_hook(x)
             if self.active_adapter not in self.sft_delta.keys():
                 return self._linear(x)
 

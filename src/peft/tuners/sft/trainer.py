@@ -88,6 +88,9 @@ class SftSelector:
 
         logger.info('Beginning selection phase')
         self.reselection_scores = {}
+        self.scaler_row = {}
+        self.nsamples = {}
+        self.H = {}
         # Apply hooks to gather gradients for growth selection
         for n, m in self.model.named_modules():
             if (
@@ -96,8 +99,11 @@ class SftSelector:
                 m.active_adapter in m.sft_delta
             ):
                 m.apply_hook(self.gradient_accumulation_hook(n))
-                if self.sft_config.drop_algorithm is not "magnitude":
-                    m.drop_hook_handle = m.register_module_forward_hook(self.get_wanda_hook())
+                if self.sft_config.drop_algorithm == "wanda":
+                    m.apply_pre_forward_hook(self.get_wanda_hook(n))
+                if self.sft_config.drop_algorithm == "sparsegpt":
+                    m.apply_pre_forward_hook(self.get_sparse_gpt_hook(n))
+
 
     def end_selection_phase(self):
         logger.info('Ending selection phase')
@@ -113,8 +119,8 @@ class SftSelector:
                     m.active_adapter in m.sft_delta
                 ):
                     m.apply_hook(None)
-                    if self.sft_config.drop_algorithm is not "magnitude":
-                        m.drop_hook_handle.remove()
+                    if self.sft_config.drop_algorithm != "magnitude":
+                        m.apply_pre_forward_hook(None)
 
         # Replace all parameters if it's the first reselection step, linear
         # decay from initial rate otherwise.
@@ -133,6 +139,9 @@ class SftSelector:
             raise ValueError(f'Unsupported reselection rate policy {self.sft_config.reselection_rate_policy}')
         self.select(p)
         self.reselection_scores = {}
+        self.scaler_row = {}
+        self.nsamples = {}
+        self.H = {}
 
     def select(self, p):
         
@@ -141,6 +150,8 @@ class SftSelector:
             drop_fn = self.drop_magnitude
         elif self.sft_config.drop_algorithm == "wanda":
             drop_fn = self.drop_wanda
+        elif self.sft_config.drop_algorithm == "sparsegpt":
+            drop_fn = self.drop_sparsegpt
         else:
             raise ValueError(f'Invalid drop method {self.sft_config.drop_algorithm}')
 
@@ -183,22 +194,49 @@ class SftSelector:
 
         return _gradient_accumulation_hook
 
-    def get_wanda_hook(self):
-        def wanda_hook(module, inp, output):
-            # ToDo: handle aggregation of multiple inputs
+    def get_wanda_hook(self, module_name):
+        def _wanda_hook(inp):
+            inp = inp.detach()
             if len(inp.shape) == 2:
                 inp = inp.unsqueeze(0)
             tmp = inp.shape[0]
-            if isinstance(self.layer, nn.Linear):
-                if len(inp.shape) == 3:
-                    inp = inp.reshape((-1, inp.shape[-1]))
-                inp = inp.t()
-
-            self.scaler_row *= self.nsamples / (self.nsamples+tmp)
-            self.nsamples += tmp
-
+            if len(inp.shape) == 3:
+                inp = inp.reshape((-1, inp.shape[-1]))
+            inp = inp.t()
+            
             inp = inp.type(torch.float32)
-            self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples
+
+            if module_name in self.scaler_row:
+                self.scaler_row[module_name] *= self.nsamples[module_name] / (self.nsamples[module_name]+tmp)
+                self.nsamples[module_name] += tmp
+                self.scaler_row[module_name] += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples[module_name]
+            else:
+                self.nsamples[module_name] = tmp
+                self.scaler_row[module_name] = torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples[module_name]
+        return _wanda_hook
+
+    def get_sparse_gpt_hook(self, module_name):
+        def _sparse_gpt_hook(inp):
+            inp = inp.detach().to(torch.bfloat16)
+            if len(inp.shape) == 2:
+                inp = inp.unsqueeze(0)
+            tmp = inp.shape[0]
+            if len(inp.shape) == 3:
+                inp = inp.reshape((-1, inp.shape[-1]))
+            inp = inp.t()
+            # logger.info(f"Module {module_name} adding x with: {inp.shape}")
+            if module_name in self.scaler_row:
+                # logger.info(module_name)
+                self.scaler_row[module_name] *= self.nsamples[module_name] / (self.nsamples[module_name] + tmp)
+                self.nsamples[module_name] += tmp
+                # logger.info(f"x shap: {inp.shape}")
+                inp = math.sqrt(2 / self.nsamples[module_name]) * inp
+                self.scaler_row[module_name] += inp.matmul(inp.t())
+            else:
+                self.nsamples[module_name] = tmp
+                inp = math.sqrt(2 / self.nsamples[module_name]) * inp
+                self.scaler_row[module_name] = inp.matmul(inp.t())
+        return _sparse_gpt_hook
 
 
     def active_sft_deltas(self):
@@ -213,7 +251,7 @@ class SftSelector:
                     m.sft_delta[m.active_adapter]
                 )
 
-    def drop_magnitude(self, num_to_reallocate, delta):
+    def drop_magnitude(self, num_to_reallocate, delta, module_name):
         _, changing_indices = torch.topk(
             torch.abs(delta.values),
             num_to_reallocate,
@@ -223,12 +261,149 @@ class SftSelector:
         return changing_indices
 
 
-    def drop_wanda(self, num_to_reallocate, delta):
-        W_metric = torch.abs(delta.values.data) * torch.sqrt(delta.scaler_row.reshape((1,-1)))
-        sort_res = torch.sort(W_metric, dim=-1, stable=True)
-        indices = sort_res[1][:,:num_to_reallocate]
-        return indices
+    def drop_wanda(self, num_to_reallocate, delta, module_name):
+        logger.info(
+            f'Num to reallocate: {num_to_reallocate}'
+        )
+        W = torch.zeros(delta.shape, device=delta.values.device)
+        W.view(-1).scatter_reduce_(
+            0,
+            delta.indices.long(),
+            delta.values,
+            "sum",
+            include_self=False,
+        )
+        logger.info(f"W shape: {W.shape}")
+        W_metric = torch.abs(W) * torch.sqrt(self.scaler_row[module_name].reshape((1,-1)))
 
+        relevant_scores = W_metric.view(-1)[delta.indices]
+        logger.info(f"relevant_scores: {relevant_scores}")
+        logger.info(f"relevant_scores shape: {relevant_scores.shape}")
+
+        _, changing_indices = torch.topk(
+            relevant_scores,
+            num_to_reallocate,
+            largest=False,
+            sorted=True,
+        )
+        logger.info(f"changing indices device: {changing_indices.device}")
+        return changing_indices
+
+    def drop_sparsegpt(self, num_to_reallocate, delta, module_name):
+        percdamp=.01
+        W = torch.zeros(delta.shape, device=delta.values.device)
+        W.view(-1).scatter_reduce_(
+            0,
+            delta.indices.long(),
+            delta.values,
+            "sum",
+            include_self=False,
+        )
+        rows = W.shape[0]
+        columns = W.shape[1]
+
+        H = self.scaler_row[module_name].float()
+        del self.scaler_row[module_name]
+
+        # TODO Mask Hessian 
+         
+        # if len(x.shape) == 1:
+        #     x = x.unsqueeze(1)
+        # logger.info(f"x shape: {x.shape}")
+        # H = x @ x.t()
+        logger.info(f"H shape: {H.shape}")
+        
+
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
+        W[:, dead] = 0
+
+        # negative = [i for i, t in enumerate(torch.diag(H)) if t <= 0]
+        # logger.info(f"Negative diagonal: {negative}")
+        # negative_x = x[negative, :]
+        # logger.info(f"Negative x: {negative_x}")
+
+        # logger.info(f"10984 H diag: {H[10984, 10984]}")
+        # logger.info(f"10984 x: {x[10984]}")
+
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(columns)
+        H[diag, diag] += damp
+        # ToDo enable more efficient inverse
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True)
+        Hinv = H
+
+        # Hinv = torch.linalg.inverse(H)
+
+        # mask = None
+
+        
+
+        tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
+        thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+
+        # ToDo implement tuned method
+
+        relevant_scores = thresh.view(-1)[delta.indices]
+        logger.info(f"relevant_scores: {relevant_scores}")
+        logger.info(f"relevant_scores shape: {relevant_scores.shape}")
+
+        _, changing_indices = torch.topk(
+            relevant_scores,
+            num_to_reallocate,
+            largest=False,
+            sorted=True,
+        )
+        return changing_indices
+        # W = torch.zeros(delta.shape, device=delta.values.device)
+        # W.view(-1).scatter_reduce_(
+        #     0,
+        #     delta.indices.long(),
+        #     delta.values,
+        #     "sum",
+        #     include_self=False,
+        # )
+        # rows = W.shape[0]
+        # columns = W.shape[1]
+
+        # H = self.H[module_name]
+        # del self.H[module__name]
+        # dead = torch.diag(H) == 0
+        # H[dead, dead] = 1
+        # W[:, dead] = 0
+
+        # Losses = torch.zeros(rows, device=self.dev)
+
+        # damp = percdamp * torch.mean(torch.diag(H))
+        # diag = torch.arange(columns, device=self.dev)
+        # H[diag, diag] += damp
+        # H = torch.linalg.cholesky(H)
+        # H = torch.cholesky_inverse(H)
+        # H = torch.linalg.cholesky(H, upper=True)
+        # Hinv = H
+
+        # mask = None
+
+        # tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
+        # thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+
+        # # ToDo implement tuned method
+
+        # relevant_scores = thresh.view(-1)[delta.indices]
+        # logger.info(f"relevant_scores: {relevant_scores}")
+        # logger.info(f"relevant_scores shape: {relevant_scores.shape}")
+
+        # _, changing_indices = torch.topk(
+        #     relevant_scores,
+        #     num_to_reallocate,
+        #     largest=False,
+        #     sorted=True,
+        # )
+        # return changing_indices
+
+           
     @torch.no_grad()
     def select_rigl(self, change_proportion, drop):
         n_replacements = 0
@@ -251,7 +426,7 @@ class SftSelector:
 
             num_to_reallocate = int(len(delta.values) * change_proportion)
             # Find the k deltas with smallest absolute values
-            changing_indices = drop(num_to_reallocate, delta)
+            changing_indices = drop(num_to_reallocate, delta, module_name)
             outgoing_params = delta.indices[changing_indices]
             # binary mask of weights to drop
             is_outgoing = torch.zeros(

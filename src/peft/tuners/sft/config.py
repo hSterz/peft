@@ -91,7 +91,7 @@ class SftConfig(PeftConfig):
             "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
         },
     )
-    drop_algirithm: Optional[str] = field(
+    drop_algorithm: Optional[str] = field(
         default="magnitude",
         metadata={
             "help": "Drop algorithm to use for SFT. Optrions 'magnitude' and 'wanda'. "
