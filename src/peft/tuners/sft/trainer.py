@@ -46,6 +46,14 @@ def update_optimizer(
         else:
             optimizer_params[changing_indices] = 0.0
 
+def sample(probs_1: torch.Tensor, probs_2: torch.Tensor, n: int) -> torch.Tensor:
+    """This function samples pairs from the joint probability distribution induced by the probabilities in probs_1 and probs_2 and returns the indices of the sampled pairs"""
+    # Sample n indices without replacement from probs_1 and probs_2
+    indices_1 = torch.multinomial(probs_1, num_samples=n, replacement=True)
+    indices_2 = torch.multinomial(probs_2, num_samples=n, replacement=True)
+    # Combine the indices into pairs and return as a tensor
+    return indices_1, indices_2
+
 
 class SftSelector:
     """
@@ -88,9 +96,9 @@ class SftSelector:
 
         logger.info('Beginning selection phase')
         self.reselection_scores = {}
+        self.reselection_indeces = {}
         self.scaler_row = {}
         self.nsamples = {}
-        self.H = {}
         # Apply hooks to gather gradients for growth selection
         for n, m in self.model.named_modules():
             if (
@@ -98,7 +106,25 @@ class SftSelector:
                 m.active_adapter is not None and
                 m.active_adapter in m.sft_delta
             ):
-                m.apply_hook(self.gradient_accumulation_hook(n))
+                if self.sft_config.selection_algorithm == "rigl":
+                    m.apply_hook(self.gradient_accumulation_hook(n))
+                if self.sft_config.selection_algorithm == "gse":
+                    p = m.weight
+                    probs_out = p.new_ones(p.size(0), dtype=torch.float32)
+                    probs_in = p.new_ones(math.prod(p.shape[1:]), dtype=torch.float32)
+                    num = int(m.sft_delta[m.active_adapter].indices.shape[0] * self.sft_config.subset_fraction)
+                    logger.info(f"selecting {n} candidates")
+
+                    to_nodes, from_nodes = sample(probs_out, probs_in, num)
+
+                    grad_mask = torch.zeros_like(p, dtype=torch.bool)
+                    grad_mask[to_nodes, from_nodes] = True
+                    grad_mask = grad_mask.view(-1)
+                    candidate_indices = torch.arange(grad_mask.shape[0], device=grad_mask.device)[grad_mask]
+                    logger.info(f"Selected candidates: {candidate_indices}")
+
+                    m.apply_hook(self.gradient_accumulation_hook(n, candidate_indices))
+                    
                 if self.sft_config.drop_algorithm == "wanda":
                     m.apply_pre_forward_hook(self.get_wanda_hook(n))
                 if self.sft_config.drop_algorithm == "sparsegpt":
@@ -139,9 +165,9 @@ class SftSelector:
             raise ValueError(f'Unsupported reselection rate policy {self.sft_config.reselection_rate_policy}')
         self.select(p)
         self.reselection_scores = {}
+        self.reselection_indeces = {}
         self.scaler_row = {}
         self.nsamples = {}
-        self.H = {}
 
     def select(self, p):
         
@@ -157,14 +183,14 @@ class SftSelector:
 
         if self.sft_config.selection_algorithm == "sm3":
             self.select_sm3(p, drop_fn)
-        elif self.sft_config.selection_algorithm == "rigl":
+        elif self.sft_config.selection_algorithm == "rigl" or self.sft_config.selection_algorithm == "gse":
             self.select_rigl(p, drop_fn)
         else:
             raise ValueError(
                 f'Invalid selection method {self.sft_config.selection_algorithm}'
             )
 
-    def gradient_accumulation_hook(self, module_name):
+    def gradient_accumulation_hook(self, module_name, candidates=None):
 
         @torch.no_grad()
         def _gradient_accumulation_hook(grad):
@@ -177,13 +203,16 @@ class SftSelector:
                 candidate_grads_sq.addcmul_(new_grads, new_grads)
                 samples += 1
             else:
-                num_candidates = len(m.sft_delta[m.active_adapter].values)
-                _, candidate_indices = torch.topk(
-                    torch.abs(grad),
-                    num_candidates,
-                    largest=True,
-                    sorted=False,
-                )
+                if candidates is not None:
+                    candidate_indices = candidates
+                else:
+                    num_candidates = len(m.sft_delta[m.active_adapter].values)
+                    _, candidate_indices = torch.topk(
+                        torch.abs(grad),
+                        num_candidates,
+                        largest=True,
+                        sorted=False,
+                    )
                 candidate_grads = grad[candidate_indices]
                 self.reselection_scores[module_name] = (
                     candidate_indices.to(m.sft_delta[m.active_adapter].indices.dtype),
@@ -217,7 +246,7 @@ class SftSelector:
 
     def get_sparse_gpt_hook(self, module_name):
         def _sparse_gpt_hook(inp):
-            inp = inp.detach().to(torch.bfloat16)
+            inp = inp.detach().float()
             if len(inp.shape) == 2:
                 inp = inp.unsqueeze(0)
             tmp = inp.shape[0]
@@ -235,7 +264,7 @@ class SftSelector:
             else:
                 self.nsamples[module_name] = tmp
                 inp = math.sqrt(2 / self.nsamples[module_name]) * inp
-                self.scaler_row[module_name] = inp.matmul(inp.t())
+                self.scaler_row[module_name] = inp.matmul(inp.t()).to(torch.bfloat16)
         return _sparse_gpt_hook
 
 
@@ -291,7 +320,7 @@ class SftSelector:
 
     def drop_sparsegpt(self, num_to_reallocate, delta, module_name):
         percdamp=.01
-        W = torch.zeros(delta.shape, device=delta.values.device)
+        W = torch.zeros(delta.shape, device=delta.values.device, dtype=delta.values.dtype)
         W.view(-1).scatter_reduce_(
             0,
             delta.indices.long(),
@@ -299,11 +328,13 @@ class SftSelector:
             "sum",
             include_self=False,
         )
+        logger.info(W.shape)
         rows = W.shape[0]
         columns = W.shape[1]
 
         H = self.scaler_row[module_name].float()
         del self.scaler_row[module_name]
+        logger.info(f"Hessian: {H}")
 
         # TODO Mask Hessian 
          
@@ -329,24 +360,31 @@ class SftSelector:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(columns)
         H[diag, diag] += damp
-        # ToDo enable more efficient inverse
+        logger.info(f"Hessian: {H}")
+        if torch.isnan(H).any() or torch.isinf(H).any():
+            logger.info("Input matrix contains NaNs or infinite values. Clean the input matrix first.")
+
+        # eigval = torch.linalg.eigvals(H)
+        # logger.info(f"Eigen values of H: {eigval}")
+        # logger.info(f"Positive definit: {torch.all(eigval > 0)}")
         H = torch.linalg.cholesky(H)
+        logger.info(f"Hessian Cholesky: {H}")
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+
+        logger.info(f"H inverse: {Hinv}")
 
         # Hinv = torch.linalg.inverse(H)
 
         # mask = None
 
-        
-
         tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
-        thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+        logger.info(f"SparseGPT metric: {tmp}")
 
         # ToDo implement tuned method
 
-        relevant_scores = thresh.view(-1)[delta.indices]
+        relevant_scores = tmp.view(-1)[delta.indices]
         logger.info(f"relevant_scores: {relevant_scores}")
         logger.info(f"relevant_scores shape: {relevant_scores.shape}")
 

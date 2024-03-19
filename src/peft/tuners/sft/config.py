@@ -97,6 +97,12 @@ class SftConfig(PeftConfig):
             "help": "Drop algorithm to use for SFT. Optrions 'magnitude' and 'wanda'. "
         },
     )
+    subset_fraction: Optional[float] = field(
+        default=1,
+        metadata={
+            "help": "The size of the sampled subset for gse relative to the number of weights in the delta."
+        }
+    )
 
     def __post_init__(self):
         self.peft_type = PeftType.SFT

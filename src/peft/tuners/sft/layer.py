@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from peft.import_utils import is_bnb_available
 from peft.tuners.tuners_utils import BaseTunerLayer
-import linear_sd
+import linear_sd_cpp as linear_sd
 
 BNB_AVAILABLE = is_bnb_available()
 if BNB_AVAILABLE:
