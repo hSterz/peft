@@ -103,6 +103,12 @@ class SftConfig(PeftConfig):
             "help": "The size of the sampled subset for gse relative to the number of weights in the delta."
         }
     )
+    selection_level: Optional[str] = field(
+        default = "layer", 
+        metadata = {
+            "help": "The level on which parameter reselection should happen (layer, global)."
+        }
+    )
 
     def __post_init__(self):
         self.peft_type = PeftType.SFT

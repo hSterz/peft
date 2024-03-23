@@ -46,6 +46,44 @@ def update_optimizer(
         else:
             optimizer_params[changing_indices] = 0.0
 
+def optimizer_resize_param(optimizer, param, changing_indices, init_momenta, staying, weight_change=0):
+
+    if weight_change == 0:
+        update_optimizer(optimizer, param, changing_indices, init_momenta) 
+    else:
+        if isinstance(optimizer, AcceleratedOptimizer):
+            optimizer = optimizer.optimizer
+
+        optimizer_state = optimizer.state[param]
+        if weight_change > 0:
+            for optim_aux in ['age', 'exp_avg', 'exp_avg_sq']:
+                optimizer_params = optimizer_state[optim_aux]
+                optimizer_params = torch.cat((optimizer_params,torch.zeros((weight_change), dtype=optimizer_params.dtype, device=optimizer_params.device)))
+                init = init_momenta.get(optim_aux, None)
+                if init is not None:
+                    if isinstance(init, torch.Tensor):
+                        init = init.to(dtype=optimizer_params.dtype)
+                    optimizer_params[changing_indices] = init
+                else:
+                    optimizer_params[changing_indices] = 0.0
+        else:
+            for optim_aux in ['age', 'exp_avg', 'exp_avg_sq']:
+                optimizer_params = optimizer_state[optim_aux]
+                new_size = optimizer_params.shape[0] + weight_change
+                optimizer_params = optimizer_params[staying]
+                num_staying = optimizer_params.shape[0]
+                optimizer_params = torch.cat((optimizer_params, torch.zeros((new_size - num_staying), dtype=optimizer_params.dtype, device=optimizer_params.device)))
+                init = init_momenta.get(optim_aux, None)
+                if init is not None:
+                    if isinstance(init, torch.Tensor):
+                        init = init.to(dtype=optimizer_params.dtype)
+                    optimizer_params[num_staying:] = init
+                else:
+                    optimizer_params[num_staying:] = 0.0
+
+
+
+
 def sample(probs_1: torch.Tensor, probs_2: torch.Tensor, n: int) -> torch.Tensor:
     """This function samples pairs from the joint probability distribution induced by the probabilities in probs_1 and probs_2 and returns the indices of the sampled pairs"""
     # Sample n indices without replacement from probs_1 and probs_2
@@ -72,6 +110,7 @@ class SftSelector:
     ):
         self.model = model
         self.optimizer = optimizer
+        logger.info(f"Optimizer: {optimizer}")
         self.sft_config = sft_config
         self.total_update_steps = total_update_steps
         self.grad_accumulation_steps = grad_accumulation_steps
@@ -96,10 +135,36 @@ class SftSelector:
 
         logger.info('Beginning selection phase')
         self.reselection_scores = {}
-        self.reselection_indeces = {}
         self.scaler_row = {}
         self.nsamples = {}
+
+        if self.sft_config.selection_algorithm == "gse" and self.sft_config.selection_level == "global":
+            num_deltas = 0
+            weights = []
+            for n, m in self.model.named_modules():
+                if (
+                    isinstance(m, Linear) and
+                    m.active_adapter is not None and
+                    m.active_adapter in m.sft_delta
+                ):
+                    num_deltas += 1
+                    weights.append(m.sft_delta[m.active_adapter].indices.shape[0])
+
+            num_connections = sum(weights)
+            self.num_delta_weights =  num_connections
+            num_to_sample = num_connections * self.sft_config.subset_fraction
+            batch_size = int(1e5)
+            layer_nums = torch.zeros(num_deltas)
+            src = torch.ones((int(batch_size)))
+            weights = torch.tensor(weights, dtype=torch.float32)
+            for idx in range(0, num_to_sample, batch_size):
+                num = min(batch_size,  num_to_sample-idx)
+                index = torch.multinomial(weights, num, replacement=True)
+                layer_nums = layer_nums.scatter_reduce(0, index, src, reduce="sum")
+            logger.info(f"Sampled candidate distribution over the deltas: {layer_nums}")
+
         # Apply hooks to gather gradients for growth selection
+        layer_idx = 0
         for n, m in self.model.named_modules():
             if (
                 isinstance(m, Linear) and
@@ -112,16 +177,34 @@ class SftSelector:
                     p = m.weight
                     probs_out = p.new_ones(p.size(0), dtype=torch.float32)
                     probs_in = p.new_ones(math.prod(p.shape[1:]), dtype=torch.float32)
-                    num = int(m.sft_delta[m.active_adapter].indices.shape[0] * self.sft_config.subset_fraction)
-                    logger.info(f"selecting {n} candidates")
+                    if self.sft_config.selection_level == "global":
+                        num = int(layer_nums[layer_idx].item())
+                        layer_idx += 1
+                    else:
+                        num = int(m.sft_delta[m.active_adapter].indices.shape[0] * self.sft_config.subset_fraction)
 
                     to_nodes, from_nodes = sample(probs_out, probs_in, num)
 
-                    grad_mask = torch.zeros_like(p, dtype=torch.bool)
+                    grad_mask = torch.zeros(
+                        m.sft_delta[m.active_adapter].shape, 
+                        dtype=torch.bool, 
+                        device=m.sft_delta[m.active_adapter].indices.device,
+                    )
+                    logger.info(grad_mask.shape)
                     grad_mask[to_nodes, from_nodes] = True
+
+                    # remove already active indeces from candidate list
+                    is_current = torch.zeros(
+                        [m.sft_delta[m.active_adapter].dense_numel],
+                        dtype=torch.bool,
+                        device=m.sft_delta[m.active_adapter].indices.device,
+                    )
+                    is_current[m.sft_delta[m.active_adapter].indices] = True
+
                     grad_mask = grad_mask.view(-1)
-                    candidate_indices = torch.arange(grad_mask.shape[0], device=grad_mask.device)[grad_mask]
-                    logger.info(f"Selected candidates: {candidate_indices}")
+
+                    grad_mask = torch.logical_and(grad_mask, ~is_current)
+                    candidate_indices = torch.arange(grad_mask.shape[0], device=grad_mask.device)[grad_mask] 
 
                     m.apply_hook(self.gradient_accumulation_hook(n, candidate_indices))
                     
@@ -165,7 +248,6 @@ class SftSelector:
             raise ValueError(f'Unsupported reselection rate policy {self.sft_config.reselection_rate_policy}')
         self.select(p)
         self.reselection_scores = {}
-        self.reselection_indeces = {}
         self.scaler_row = {}
         self.nsamples = {}
 
@@ -183,6 +265,8 @@ class SftSelector:
 
         if self.sft_config.selection_algorithm == "sm3":
             self.select_sm3(p, drop_fn)
+        elif self.sft_config.selection_algorithm == "gse" and self.sft_config.selection_level == "global":
+            self.select_gse_global(p, drop_fn)
         elif self.sft_config.selection_algorithm == "rigl" or self.sft_config.selection_algorithm == "gse":
             self.select_rigl(p, drop_fn)
         else:
@@ -302,12 +386,9 @@ class SftSelector:
             "sum",
             include_self=False,
         )
-        logger.info(f"W shape: {W.shape}")
         W_metric = torch.abs(W) * torch.sqrt(self.scaler_row[module_name].reshape((1,-1)))
 
         relevant_scores = W_metric.view(-1)[delta.indices]
-        logger.info(f"relevant_scores: {relevant_scores}")
-        logger.info(f"relevant_scores shape: {relevant_scores.shape}")
 
         _, changing_indices = torch.topk(
             relevant_scores,
@@ -315,7 +396,6 @@ class SftSelector:
             largest=False,
             sorted=True,
         )
-        logger.info(f"changing indices device: {changing_indices.device}")
         return changing_indices
 
     def drop_sparsegpt(self, num_to_reallocate, delta, module_name):
@@ -375,10 +455,6 @@ class SftSelector:
 
         logger.info(f"H inverse: {Hinv}")
 
-        # Hinv = torch.linalg.inverse(H)
-
-        # mask = None
-
         tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
         logger.info(f"SparseGPT metric: {tmp}")
 
@@ -395,51 +471,271 @@ class SftSelector:
             sorted=True,
         )
         return changing_indices
-        # W = torch.zeros(delta.shape, device=delta.values.device)
-        # W.view(-1).scatter_reduce_(
-        #     0,
-        #     delta.indices.long(),
-        #     delta.values,
-        #     "sum",
-        #     include_self=False,
-        # )
-        # rows = W.shape[0]
-        # columns = W.shape[1]
 
-        # H = self.H[module_name]
-        # del self.H[module__name]
-        # dead = torch.diag(H) == 0
-        # H[dead, dead] = 1
-        # W[:, dead] = 0
+    @torch.no_grad()
+    def select_gse_global(self, change_proportion, drop):
+        n_replacements = 0
+        total_params = 0
 
-        # Losses = torch.zeros(rows, device=self.dev)
+        betas = {}
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                betas[p] = group['betas']
+        
+        # If the parameters are selected in globa level compute which indeces are selected first
+        if self.sft_config.selection_level == "global":
+            grads = None
+            # Collect all candidate gradients
+            for module_name, (
+                candidate_indices,
+                candidate_grads,
+                candidate_grads_sq,
+                candidate_samples
+            ) in self.reselection_scores.items():
+                if grads is None:
+                    grads = torch.abs(candidate_indices)
+                else:
+                    grads = torch.cat((grads, torch.abs(candidate_indices)))
 
-        # damp = percdamp * torch.mean(torch.diag(H))
-        # diag = torch.arange(columns, device=self.dev)
-        # H[diag, diag] += damp
-        # H = torch.linalg.cholesky(H)
-        # H = torch.cholesky_inverse(H)
-        # H = torch.linalg.cholesky(H, upper=True)
-        # Hinv = H
+            num_grads = grads.shape[0]
 
-        # mask = None
+            # compute number of changing parameters
+            num_to_reallocate = int(min(self.num_delta_weights * change_proportion, num_grads))
+            
+            # get candidates with biggest gradient
+            _ ,indices = torch.topk(
+                grads,
+                num_to_reallocate,
+                largest=True,
+                sorted=True,
+            )
 
-        # tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
-        # thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+            del grads
 
-        # # ToDo implement tuned method
+            mask = torch.zeros(num_grads, dtype=torch.bool, device=indices.device)
+            mask[indices] = True
 
-        # relevant_scores = thresh.view(-1)[delta.indices]
-        # logger.info(f"relevant_scores: {relevant_scores}")
-        # logger.info(f"relevant_scores shape: {relevant_scores.shape}")
+            # save grwoing candidates for later
+            growing_candidates = {}
 
-        # _, changing_indices = torch.topk(
-        #     relevant_scores,
-        #     num_to_reallocate,
-        #     largest=False,
-        #     sorted=True,
-        # )
-        # return changing_indices
+            for module_name, (
+                candidate_indices,
+                candidate_grads,
+                candidate_grads_sq,
+                candidate_samples
+            ) in self.reselection_scores.items():
+                relevant = mask[:candidate_indices.shape[0]]
+                mask = mask[candidate_indices.shape[0]:]
+                growing_indices = relevant.nonzero().squeeze() # candidate_indices[relevant]
+                growing_scores = torch.abs(candidate_grads)[relevant]
+                growing_candidates[module_name] = (growing_scores, growing_indices)
+                logger.info(module_name)
+                logger.info(f"Relevant mask: {relevant}")
+                logger.info(f"Growing indices {growing_indices.shape}")
+                logger.info(f"Growing indices {growing_indices}")
+            logger.info(f"Reamining mask: {mask}")
+            assert len(mask) == 0
+
+            
+            weights = None
+            for n, m in self.model.named_modules():
+                if (
+                    isinstance(m, Linear) and
+                    m.active_adapter is not None and
+                    m.active_adapter in m.sft_delta
+                ):
+                    if weights is None:
+                        weights = torch.abs(m.sft_delta[m.active_adapter].values)
+                    else:
+                        weights = torch.cat((weights, torch.abs(m.sft_delta[m.active_adapter].values)))
+
+            # get candidates with smallest magnitude
+            _ ,indices = torch.topk(
+                weights,
+                num_to_reallocate,
+                largest=False,
+                sorted=True,
+            )
+            num_weights = weights.shape[0]
+            del weights
+            mask = torch.zeros(num_weights, dtype=torch.bool, device=indices.device)
+            mask[indices] = True
+
+            # save grwoing candidates for later
+            dropping_weights = {}
+
+            for n, m in self.model.named_modules():
+                if (
+                    isinstance(m, Linear) and
+                    m.active_adapter is not None and
+                    m.active_adapter in m.sft_delta
+                ):
+                    delta = m.sft_delta[m.active_adapter]
+                    relevant = mask[:delta.values.shape[0]]
+                    mask = mask[delta.values.shape[0]:]
+                    dropping_indices = relevant.nonzero().squeeze() 
+                    dropping_weights[n] = dropping_indices
+            logger.info(mask)
+            assert len(mask) == 0
+
+        for module_name, (
+            candidate_indices,
+            candidate_grads,
+            candidate_grads_sq,
+            candidate_samples
+        ) in self.reselection_scores.items():
+            m = self.model.get_submodule(module_name)
+            delta = m.sft_delta[m.active_adapter]
+            delta.values.grad = None
+
+            changing_indices = dropping_weights[module_name]
+            num_outgoing = changing_indices.shape[0]
+            
+            # Find the k deltas with smallest absolute values
+            outgoing_params = delta.indices[changing_indices]
+            # binary mask of weights to drop
+            is_outgoing = torch.zeros(
+                [delta.dense_numel],
+                dtype=torch.bool,
+                device=outgoing_params.device,
+            )
+            is_outgoing[outgoing_params] = True
+            # binary mask of currently active weights
+            is_current = torch.zeros(
+                [delta.dense_numel],
+                dtype=torch.bool,
+                device=delta.indices.device,
+            )
+            is_current[delta.indices] = True
+            # weights that will stil be active after dropping
+            is_remaining = is_current & ~is_outgoing
+
+            # take the top k growth candidates with highest gradient magnitudes
+            best_scores, best_candidate_indices = growing_candidates[module_name]
+
+            # don't consider growing any already active candidate
+            is_valid_candidate = ~is_remaining[best_candidate_indices]
+            
+            incoming_params = candidate_indices[best_candidate_indices][is_valid_candidate]
+
+            assert torch.all(incoming_params < delta.dense_numel)
+
+            incoming_grads = candidate_grads[best_candidate_indices][is_valid_candidate]
+            incoming_grads_sq = candidate_grads_sq[best_candidate_indices][is_valid_candidate]
+            incoming_samples = candidate_samples[best_candidate_indices][is_valid_candidate]
+            # binary mask of weights to grow
+            is_incoming = torch.zeros(
+                [delta.dense_numel],
+                dtype=torch.bool,
+                device=incoming_params.device,
+            )
+            is_incoming[incoming_params] = True
+
+            outgoing_is_incoming = is_incoming[outgoing_params]
+            changing_indices = changing_indices[~outgoing_is_incoming]
+            incoming_is_outgoing = is_outgoing[incoming_params]
+
+
+            incoming_params = incoming_params[~incoming_is_outgoing]
+            incoming_grads = incoming_grads[~incoming_is_outgoing]
+            incoming_grads_sq = incoming_grads_sq[~incoming_is_outgoing]
+            incoming_samples = incoming_samples[~incoming_is_outgoing]
+            assert torch.all(incoming_params < delta.dense_numel)
+
+            # seed the optimizer momenta appropriately
+            incoming_grads /= incoming_samples
+            incoming_grads_sq /= incoming_samples
+            incoming_ages = incoming_samples / self.grad_accumulation_steps
+            beta1, beta2 = betas[delta.values]
+            # bias counter-correction: these are unbiased estimates of the momenta,
+            # so bias them in order that they will be unbiased after Adam's bias
+            # correction
+            incoming_grads *= (1.0 - beta1 ** incoming_ages)
+            incoming_grads_sq *= (1.0 - beta2 ** incoming_ages)
+
+            init_momenta={
+                    'age': incoming_ages,
+                    'exp_avg': incoming_grads,
+                    'exp_avg_sq': incoming_grads_sq,
+                }
+
+            prev_parameter = delta.values
+            logger.info(f"Dense num: {delta.dense_numel}")
+
+            overlap = np.intersect1d(delta.indices.detach().cpu().numpy(), incoming_params.detach().cpu().numpy())
+            logger.info(f"Overlap {overlap}")
+
+            if torch.sum(is_incoming) >  torch.sum(is_outgoing):
+                overhead = torch.sum(is_incoming) - torch.sum(is_outgoing)
+                logger.info(f"Overhead: {overhead}")
+                prev_delta_size = delta.indices.shape[0]
+
+                changing_indices = torch.cat((changing_indices, torch.arange(delta.indices.shape[0], delta.indices.shape[0]+overhead, device=incoming_params.device)))
+                delta.indices = torch.cat((delta.indices, torch.zeros((overhead), dtype=delta.indices.dtype, device=delta.indices.device)))
+                delta.values = torch.nn.Parameter(torch.cat((delta.values, torch.zeros((overhead), dtype=delta.values.dtype, device=delta.values.device))))
+                
+
+                delta.indices[changing_indices] = incoming_params.to(delta.indices.dtype)
+                delta.values[changing_indices] = 0.0
+                
+
+                optimizer_resize_param(
+                    self.optimizer, 
+                    prev_parameter, 
+                    changing_indices, 
+                    init_momenta, 
+                    None, 
+                    weight_change=overhead
+                )
+                assert torch.all(delta.indices < delta.dense_numel)
+
+                assert prev_delta_size + overhead == delta.values.shape[0]
+            elif torch.sum(is_incoming) < torch.sum(is_outgoing):
+                overhead = torch.sum(is_outgoing) - torch.sum(is_incoming)
+                logger.info(f"Overhead: -{overhead}")
+                is_staying = torch.ones(
+                    delta.indices.shape,
+                    dtype=torch.bool,
+                    device=delta.values.device,
+                )
+                is_staying[changing_indices] = False
+                staying = is_staying.nonzero().squeeze() 
+                prev_delta_size = delta.indices.shape[0]
+
+                delta.indices = torch.cat((delta.indices[staying], incoming_params.to(delta.indices.dtype)))
+                delta.values = torch.nn.Parameter(torch.cat((delta.values[staying], torch.zeros((incoming_params.shape[0]), dtype=delta.values.dtype, device=delta.values.device))))
+                optimizer_resize_param(
+                    self.optimizer, 
+                    prev_parameter, 
+                    changing_indices, 
+                    init_momenta, 
+                    staying, 
+                    weight_change=-overhead
+                )
+                assert prev_delta_size - overhead == delta.values.shape[0]
+            else:
+                # update delta indices and values
+                delta.indices[changing_indices] = incoming_params.to(delta.indices.dtype)
+                delta.values[changing_indices] = 0.0
+                optimizer_resize_param(
+                    self.optimizer, 
+                    prev_parameter, 
+                    changing_indices, 
+                    init_momenta, 
+                    staying, 
+                    weight_change=0
+                )
+            
+            assert delta.indices.shape == delta.values.shape
+            assert torch.all(delta.indices < delta.dense_numel)
+            assert delta.values.requires_grad
+            n_replacements += len(changing_indices)
+            total_params += len(delta.indices)
+
+
+        logger.info(
+            f'Replacing {n_replacements} ({100*n_replacements/total_params:.4f}%)'
+        )
 
            
     @torch.no_grad()
