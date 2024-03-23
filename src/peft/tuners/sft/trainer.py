@@ -210,8 +210,6 @@ class SftSelector:
                     
                 if self.sft_config.drop_algorithm == "wanda":
                     m.apply_pre_forward_hook(self.get_wanda_hook(n))
-                if self.sft_config.drop_algorithm == "sparsegpt":
-                    m.apply_pre_forward_hook(self.get_sparse_gpt_hook(n))
 
 
     def end_selection_phase(self):
@@ -258,8 +256,6 @@ class SftSelector:
             drop_fn = self.drop_magnitude
         elif self.sft_config.drop_algorithm == "wanda":
             drop_fn = self.drop_wanda
-        elif self.sft_config.drop_algorithm == "sparsegpt":
-            drop_fn = self.drop_sparsegpt
         else:
             raise ValueError(f'Invalid drop method {self.sft_config.drop_algorithm}')
 
@@ -328,30 +324,6 @@ class SftSelector:
                 self.scaler_row[module_name] = torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples[module_name]
         return _wanda_hook
 
-    def get_sparse_gpt_hook(self, module_name):
-        def _sparse_gpt_hook(inp):
-            inp = inp.detach().float()
-            if len(inp.shape) == 2:
-                inp = inp.unsqueeze(0)
-            tmp = inp.shape[0]
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-            # logger.info(f"Module {module_name} adding x with: {inp.shape}")
-            if module_name in self.scaler_row:
-                # logger.info(module_name)
-                self.scaler_row[module_name] *= self.nsamples[module_name] / (self.nsamples[module_name] + tmp)
-                self.nsamples[module_name] += tmp
-                # logger.info(f"x shap: {inp.shape}")
-                inp = math.sqrt(2 / self.nsamples[module_name]) * inp
-                self.scaler_row[module_name] += inp.matmul(inp.t())
-            else:
-                self.nsamples[module_name] = tmp
-                inp = math.sqrt(2 / self.nsamples[module_name]) * inp
-                self.scaler_row[module_name] = inp.matmul(inp.t()).to(torch.bfloat16)
-        return _sparse_gpt_hook
-
-
     def active_sft_deltas(self):
         for n, m in self.model.named_modules():
             if (
@@ -389,80 +361,6 @@ class SftSelector:
         W_metric = torch.abs(W) * torch.sqrt(self.scaler_row[module_name].reshape((1,-1)))
 
         relevant_scores = W_metric.view(-1)[delta.indices]
-
-        _, changing_indices = torch.topk(
-            relevant_scores,
-            num_to_reallocate,
-            largest=False,
-            sorted=True,
-        )
-        return changing_indices
-
-    def drop_sparsegpt(self, num_to_reallocate, delta, module_name):
-        percdamp=.01
-        W = torch.zeros(delta.shape, device=delta.values.device, dtype=delta.values.dtype)
-        W.view(-1).scatter_reduce_(
-            0,
-            delta.indices.long(),
-            delta.values,
-            "sum",
-            include_self=False,
-        )
-        logger.info(W.shape)
-        rows = W.shape[0]
-        columns = W.shape[1]
-
-        H = self.scaler_row[module_name].float()
-        del self.scaler_row[module_name]
-        logger.info(f"Hessian: {H}")
-
-        # TODO Mask Hessian 
-         
-        # if len(x.shape) == 1:
-        #     x = x.unsqueeze(1)
-        # logger.info(f"x shape: {x.shape}")
-        # H = x @ x.t()
-        logger.info(f"H shape: {H.shape}")
-        
-
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
-
-        # negative = [i for i, t in enumerate(torch.diag(H)) if t <= 0]
-        # logger.info(f"Negative diagonal: {negative}")
-        # negative_x = x[negative, :]
-        # logger.info(f"Negative x: {negative_x}")
-
-        # logger.info(f"10984 H diag: {H[10984, 10984]}")
-        # logger.info(f"10984 x: {x[10984]}")
-
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(columns)
-        H[diag, diag] += damp
-        logger.info(f"Hessian: {H}")
-        if torch.isnan(H).any() or torch.isinf(H).any():
-            logger.info("Input matrix contains NaNs or infinite values. Clean the input matrix first.")
-
-        # eigval = torch.linalg.eigvals(H)
-        # logger.info(f"Eigen values of H: {eigval}")
-        # logger.info(f"Positive definit: {torch.all(eigval > 0)}")
-        H = torch.linalg.cholesky(H)
-        logger.info(f"Hessian Cholesky: {H}")
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
-
-        logger.info(f"H inverse: {Hinv}")
-
-        tmp = W ** 2 / (torch.diag(Hinv).reshape((1, -1))) ** 2
-        logger.info(f"SparseGPT metric: {tmp}")
-
-        # ToDo implement tuned method
-
-        relevant_scores = tmp.view(-1)[delta.indices]
-        logger.info(f"relevant_scores: {relevant_scores}")
-        logger.info(f"relevant_scores shape: {relevant_scores.shape}")
 
         _, changing_indices = torch.topk(
             relevant_scores,
