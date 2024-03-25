@@ -46,7 +46,7 @@ def update_optimizer(
         else:
             optimizer_params[changing_indices] = 0.0
 
-def optimizer_resize_param(optimizer, param, changing_indices, init_momenta, staying, weight_change=0):
+def optimizer_resize_param(optimizer, param, changing_indices, init_momenta, staying, new_param, weight_change=0):
 
     if weight_change == 0:
         update_optimizer(optimizer, param, changing_indices, init_momenta) 
@@ -66,6 +66,14 @@ def optimizer_resize_param(optimizer, param, changing_indices, init_momenta, sta
                     optimizer_params[changing_indices] = init
                 else:
                     optimizer_params[changing_indices] = 0.0
+
+            del optimizer.state[param]
+            for idx, group in enumerate(optimizer.param_groups):
+                if len(group["params"]) == 1 and group["params"][0] is param:
+                    del optimizer.param_groups[idx]
+                    break
+            optimizer.add_param_group({"params": new_param})
+            logger.info(f"Num param_groups: {len(optimizer.param_groups)}")
         else:
             for optim_aux in ['age', 'exp_avg', 'exp_avg_sq']:
                 optimizer_params = optimizer_state[optim_aux]
@@ -80,6 +88,13 @@ def optimizer_resize_param(optimizer, param, changing_indices, init_momenta, sta
                     optimizer_params[num_staying:] = init
                 else:
                     optimizer_params[num_staying:] = 0.0
+            del optimizer.state[param]
+            for idx, group in enumerate(optimizer.param_groups):
+                if len(group["params"]) == 1 and group["params"][0] is param:
+                    del optimizer.param_groups[idx]
+                    break
+            optimizer.add_param_group({"params": new_param})
+            logger.info(f"Num param_groups: {len(optimizer.param_groups)}")
 
 
 
@@ -110,7 +125,6 @@ class SftSelector:
     ):
         self.model = model
         self.optimizer = optimizer
-        logger.info(f"Optimizer: {optimizer}")
         self.sft_config = sft_config
         self.total_update_steps = total_update_steps
         self.grad_accumulation_steps = grad_accumulation_steps
@@ -190,7 +204,6 @@ class SftSelector:
                         dtype=torch.bool, 
                         device=m.sft_delta[m.active_adapter].indices.device,
                     )
-                    logger.info(grad_mask.shape)
                     grad_mask[to_nodes, from_nodes] = True
 
                     # remove already active indeces from candidate list
@@ -207,6 +220,7 @@ class SftSelector:
                     candidate_indices = torch.arange(grad_mask.shape[0], device=grad_mask.device)[grad_mask] 
 
                     m.apply_hook(self.gradient_accumulation_hook(n, candidate_indices))
+                del layer_nums
                     
                 if self.sft_config.drop_algorithm == "wanda":
                     m.apply_pre_forward_hook(self.get_wanda_hook(n))
@@ -248,6 +262,7 @@ class SftSelector:
         self.reselection_scores = {}
         self.scaler_row = {}
         self.nsamples = {}
+        logger.info(f"Number of optim param_groups: {len(self.optimizer.param_groups)}")
 
     def select(self, p):
         
@@ -262,8 +277,10 @@ class SftSelector:
         if self.sft_config.selection_algorithm == "sm3":
             self.select_sm3(p, drop_fn)
         elif self.sft_config.selection_algorithm == "gse" and self.sft_config.selection_level == "global":
+            logger.info("Selecting with global GSE")
             self.select_gse_global(p, drop_fn)
         elif self.sft_config.selection_algorithm == "rigl" or self.sft_config.selection_algorithm == "gse":
+            logger.info("Selecting with RigL")
             self.select_rigl(p, drop_fn)
         else:
             raise ValueError(
@@ -300,6 +317,7 @@ class SftSelector:
                     candidate_grads * candidate_grads,
                     torch.ones_like(candidate_grads)
                 )
+                del candidates
 
         return _gradient_accumulation_hook
 
@@ -347,9 +365,7 @@ class SftSelector:
 
 
     def drop_wanda(self, num_to_reallocate, delta, module_name):
-        logger.info(
-            f'Num to reallocate: {num_to_reallocate}'
-        )
+        
         W = torch.zeros(delta.shape, device=delta.values.device)
         W.view(-1).scatter_reduce_(
             0,
@@ -427,11 +443,6 @@ class SftSelector:
                 growing_indices = relevant.nonzero().squeeze() # candidate_indices[relevant]
                 growing_scores = torch.abs(candidate_grads)[relevant]
                 growing_candidates[module_name] = (growing_scores, growing_indices)
-                logger.info(module_name)
-                logger.info(f"Relevant mask: {relevant}")
-                logger.info(f"Growing indices {growing_indices.shape}")
-                logger.info(f"Growing indices {growing_indices}")
-            logger.info(f"Reamining mask: {mask}")
             assert len(mask) == 0
 
             
@@ -459,7 +470,7 @@ class SftSelector:
             mask = torch.zeros(num_weights, dtype=torch.bool, device=indices.device)
             mask[indices] = True
 
-            # save grwoing candidates for later
+            # save growing candidates for later
             dropping_weights = {}
 
             for n, m in self.model.named_modules():
@@ -473,7 +484,6 @@ class SftSelector:
                     mask = mask[delta.values.shape[0]:]
                     dropping_indices = relevant.nonzero().squeeze() 
                     dropping_weights[n] = dropping_indices
-            logger.info(mask)
             assert len(mask) == 0
 
         for module_name, (
@@ -558,14 +568,9 @@ class SftSelector:
                 }
 
             prev_parameter = delta.values
-            logger.info(f"Dense num: {delta.dense_numel}")
-
-            overlap = np.intersect1d(delta.indices.detach().cpu().numpy(), incoming_params.detach().cpu().numpy())
-            logger.info(f"Overlap {overlap}")
 
             if torch.sum(is_incoming) >  torch.sum(is_outgoing):
                 overhead = torch.sum(is_incoming) - torch.sum(is_outgoing)
-                logger.info(f"Overhead: {overhead}")
                 prev_delta_size = delta.indices.shape[0]
 
                 changing_indices = torch.cat((changing_indices, torch.arange(delta.indices.shape[0], delta.indices.shape[0]+overhead, device=incoming_params.device)))
@@ -583,14 +588,14 @@ class SftSelector:
                     changing_indices, 
                     init_momenta, 
                     None, 
-                    weight_change=overhead
+                    new_param=delta.values,
+                    weight_change=overhead,
                 )
                 assert torch.all(delta.indices < delta.dense_numel)
 
                 assert prev_delta_size + overhead == delta.values.shape[0]
             elif torch.sum(is_incoming) < torch.sum(is_outgoing):
                 overhead = torch.sum(is_outgoing) - torch.sum(is_incoming)
-                logger.info(f"Overhead: -{overhead}")
                 is_staying = torch.ones(
                     delta.indices.shape,
                     dtype=torch.bool,
@@ -608,6 +613,7 @@ class SftSelector:
                     changing_indices, 
                     init_momenta, 
                     staying, 
+                    new_param=delta.values,
                     weight_change=-overhead
                 )
                 assert prev_delta_size - overhead == delta.values.shape[0]
@@ -621,16 +627,18 @@ class SftSelector:
                     changing_indices, 
                     init_momenta, 
                     staying, 
+                    new_param=delta.values,
                     weight_change=0
                 )
             
             assert delta.indices.shape == delta.values.shape
+            assert torch.unique(delta.indices).shape == delta.indices.shape
             assert torch.all(delta.indices < delta.dense_numel)
             assert delta.values.requires_grad
             n_replacements += len(changing_indices)
             total_params += len(delta.indices)
 
-
+        # import ipdb; ipdb.set_trace()
         logger.info(
             f'Replacing {n_replacements} ({100*n_replacements/total_params:.4f}%)'
         )
@@ -796,6 +804,7 @@ class SftSelector:
         logger.info(
             f'Replacing {n_replacements} ({100*n_replacements/total_params:.4f}%)'
         )
+        logger.info(f"Number of parameters in delta: {total_params}")
 
 
 class SelectorStepCallback(TrainerCallback):
