@@ -94,18 +94,33 @@ def random_subset(shape, k, device=None, dtype=None):
 
 class SparseDelta(nn.Module):
 
-    def __init__(self, k, shape, dtype=None, device=None):
+    def __init__(self, k, shape, structured=False, dtype=None, device=None):
         super().__init__()
         self.shape = shape
         self.dense_numel = np.prod(shape)
         self.values = nn.Parameter(torch.zeros([k], dtype=dtype, device=device))
-        initial_indices = random_subset(
-            self.shape,
-            k,
-            dtype=torch.int32 if self.dense_numel < 2**31 else torch.int64,
-            device=device,
-        )
-        self.register_buffer('indices', torch.sort(initial_indices).values)
+        if structured:
+            rows = shape[0]
+            cols = np.prod(shape[1:])
+            k_rows = random_subset([rows], k, device=device)
+            k_cols = random_subset([cols], k, device=device)
+            initial_indices = self._convert_to_indices(k_rows, k_cols)
+        else:
+            initial_indices = random_subset(
+                self.shape,
+                k,
+                dtype=torch.int32 if self.dense_numel < 2**31 else torch.int64,
+                device=device,
+            )
+            self.register_buffer('indices', torch.sort(initial_indices).values)
+
+    def _convert_to_indices(self, row, col):
+        row_mask = torch.zeros(self.shape, dtype=torch.bool, device=self.values.device)
+        row_mask[row] = True
+        col_mask = torch.zeros(self.shape, dtype=torch.bool, device=self.values.device)
+        col_mask[:, col] = True
+        mask = row_mask & col_mask
+        return torch.nonzero(mask.view(-1)).squeeze()
 
     def merge(self, tensor, negate=False):
         # can be used with quantization, but this is not recommended
@@ -171,6 +186,7 @@ def AddSparseDelta(_LinearType):
             in_features: int,
             out_features: int,
             k: int,
+            structured: bool = False,
             dtype: torch.dtype = None,
             device=None,
             **kwargs
@@ -190,6 +206,7 @@ def AddSparseDelta(_LinearType):
             self.update_layer(
                 adapter_name,
                 k,
+                structured=structured,
                 dtype=dtype,
                 device=device,
             )
@@ -206,10 +223,11 @@ def AddSparseDelta(_LinearType):
         def apply_pre_forward_hook(self, hook):
             self.pre_forward_hook = hook
 
-        def update_layer(self, adapter_name, k, dtype=None, device=None):
+        def update_layer(self, adapter_name, k, structured, dtype=None, device=None):
             self.sft_delta[adapter_name] = SparseDelta(
                 k,
                 self.weight.size(),
+                structured=structured,
                 dtype=dtype,
                 device=device,
             )

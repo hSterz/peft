@@ -109,6 +109,12 @@ class SftConfig(PeftConfig):
             "help": "The level on which parameter reselection should happen (layer, global)."
         }
     )
+    structured: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether to use structured sparsity for SFT."
+        },
+    )
 
     def __post_init__(self):
         self.peft_type = PeftType.SFT

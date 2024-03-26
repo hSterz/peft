@@ -282,10 +282,37 @@ class SftSelector:
         elif self.sft_config.selection_algorithm == "rigl" or self.sft_config.selection_algorithm == "gse":
             logger.info("Selecting with RigL")
             self.select_rigl(p, drop_fn)
+        elif self.sft_config.selection_algorithm == "structured":
+            logger.info("Selecting with structured pruning")
+            self.select_structured(p)
         else:
             raise ValueError(
                 f'Invalid selection method {self.sft_config.selection_algorithm}'
             )
+        
+    def acticiation_gradient_accumulation_hook(self, module_name):
+        @torch.no_grad()
+        def _activation_gradient_accumulation_hook(grad_in, grad_out):
+            m = self.model.get_submodule(module_name)
+            grad_in = grad_in.reshape(-1)
+            grad_out = grad_out.reshape(-1)
+            if module_name in self.reselection_scores:
+                acc_in_grad, acc_out_grad, in_grads_sq, out_grads_sq, samples = self.reselection_scores[module_name]
+                new_in_grads = grad_in
+                new_out_grads = grad_out 
+                acc_in_grads += new_in_grads
+                acc_out_grads += new_out_grads
+                in_grads_sq.addcmul_(new_in_grads, new_in_grads)
+                out_grads_sq.addcmul_(new_out_grads, new_out_grads)
+                samples += 1
+            else:
+                acc_in_grads = grad_in
+                acc_out_grads = grad_out
+                in_grads_sq = grad_in * grad_in
+                out_grads_sq = grad_out * grad_out
+                samples = 1
+            self.reselection_scores[module_name] = 3
+        return _activation_gradient_accumulation_hook
 
     def gradient_accumulation_hook(self, module_name, candidates=None):
 
@@ -642,6 +669,99 @@ class SftSelector:
         logger.info(
             f'Replacing {n_replacements} ({100*n_replacements/total_params:.4f}%)'
         )
+
+    @torch.no_grad()
+    def select_sparse(self, change_proportion):
+        n_replacements = 0
+        total_params = 0
+
+        betas = {}
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                betas[p] = group['betas']
+
+        for module_name, (
+            acc_in_grad, 
+            acc_out_grad, 
+            in_grads_sq, 
+            out_grads_sq, 
+            samples
+        ) in self.reselection_scores.items():
+            m = self.model.get_submodule(module_name)
+            delta = m.sft_delta[m.active_adapter]
+        
+            num_to_reallocate = int(len(delta.values) * change_proportion)
+            d = int(num_to_reallocate + self.shape[0]*np.prod(self.shape[1:]))/(self.shape[0]*np.prod(self.shape[1:]))
+
+            # Find rows ad cols with smallest absolute values
+            row_mag = torch.norm(delta.values, dim=1)
+            col_mag = torch.norm(delta.values, dim=0)
+            drop_row_indices = torch.argsort(row_mag)[:d]
+            drop_col_indices = torch.argsort(col_mag)[:d]
+
+            is_outgoing = torch.zeros(delta.shape, dtype=torch.bool, device=delta.values.device)
+            is_outgoing[drop_row_indices] = True
+            is_outgoing[drop_row_indices] = True
+
+            outgoing_params = torch.nonzero(is_outgoing.view(-1)).squeeze()
+        
+            # Find growing rows and cols
+            score_in = torch.abs(acc_in_grad, descending=True)
+            score_out = torch.abs(acc_out_grad, descending=True)
+
+            # Ignore already active rows and cols
+            active_rows = torch.zeros(
+                delta.values.shape[0], dtype=torch.bool, device=delta.values.device
+            )
+            active_rows[delta.rows] = True
+            active_rows[drop_row_indices] = False
+            valid_rows = ~active_rows[score_in]
+            growing_rows = score_in[valid_rows].indices[:d]
+
+            active_cols = torch.zeros(
+                delta.values.shape[1], dtype=torch.bool, device=delta.values.device
+            )
+            active_cols[delta.cols] = True
+            active_cols[drop_col_indices] = False
+            valid_cols = ~active_cols[score_out]
+            growing_cols = score_out[valid_cols].indices[:d]
+
+            is_incoming = torch.zeros(delta.shape, dtype=torch.bool, device=delta.values.device)
+            is_incoming[growing_rows] = True
+            is_incoming[growing_cols] = True
+            incoming_params = torch.nonzero(is_incoming.view(-1)).squeeze()
+
+             # filter out weights which have been selected to be dropped and
+            # grown simultaneously
+            assert torch.sum(is_incoming) == torch.sum(is_outgoing)
+            outgoing_is_incoming = is_incoming[outgoing_params]
+            changing_indices = changing_indices[~outgoing_is_incoming]
+            incoming_is_outgoing = is_outgoing[incoming_params]
+            assert torch.sum(outgoing_is_incoming) == torch.sum(incoming_is_outgoing)
+            incoming_params = incoming_params[~incoming_is_outgoing]
+            changing_indices = changing_indices[:len(incoming_params)]
+
+            n_replacements += len(changing_indices)
+            total_params += len(delta.indices)
+
+            # update delta indices and values
+            delta.indices[changing_indices] = incoming_params.to(delta.indices.dtype)
+            delta.values[changing_indices] = 0.0
+
+            update_optimizer(
+                self.optimizer,
+                delta.values,
+                changing_indices,
+                init_momenta={
+                    'age': torch.zeros_like(changing_indices),
+                    'exp_avg': torch.zeros_like(changing_indices),
+                    'exp_avg_sq': torch.zeros_like(changing_indices),
+                }
+            )
+        
+            
+
+        
 
            
     @torch.no_grad()

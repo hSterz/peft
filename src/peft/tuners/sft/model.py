@@ -161,6 +161,7 @@ class SftModel(BaseTuner):
                 original_module.in_features,
                 original_module.out_features,
                 k,
+                structured=peft_config.structured,
                 bias=original_module.bias is not None,
                 device=original_module.weight.device,
                 **linear_kwargs
